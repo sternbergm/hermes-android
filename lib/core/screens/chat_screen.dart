@@ -1,6 +1,8 @@
 // Chat screen with real-time streaming via REST API.
 // Uses REST endpoints: POST /api/sessions/{id}/chat and
 // GET /api/sessions/{id}/messages.
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -199,14 +201,36 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _scrollToBottom() {
-    if (_scrollController.hasClients) {
+  void _scrollToBottom({bool animate = true}) {
+    if (!_scrollController.hasClients) return;
+    final target = _scrollController.position.maxScrollExtent;
+    if (animate) {
       _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
+        target,
         duration: const Duration(milliseconds: 300),
         curve: Curves.easeOut,
       );
+    } else {
+      _scrollController.jumpTo(target);
     }
+  }
+
+  /// Jump to the bottom after the list has had a chance to lay out.
+  ///
+  /// A single post-frame jump can undershoot because list items (and their
+  /// final heights) are built lazily, so `maxScrollExtent` may still be growing
+  /// on the first frame. Jumping again on the following frame settles us at the
+  /// true bottom — this is what keeps the chat pinned to the latest message when
+  /// entering a conversation or finishing a response.
+  void _scrollToBottomDeferred({bool animate = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _scrollToBottom(animate: animate);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _scrollToBottom(animate: false);
+      });
+    });
   }
 
   Future<void> _fetchMessages() async {
@@ -222,7 +246,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _messages = messages;
         _loading = false;
       });
-      _scrollToBottom();
+      // Start pinned to the bottom (newest message), like a regular chat app.
+      _scrollToBottomDeferred();
     } catch (e) {
       if (!mounted) return;
       final errStr = e.toString();
@@ -308,7 +333,7 @@ class _ChatScreenState extends State<ChatScreen> {
               await _speakAssistantText(assistantText);
             }
           }
-          _scrollToBottom();
+          _scrollToBottomDeferred();
         } catch (e) {
           setState(() {
             _streaming = false;
@@ -565,6 +590,18 @@ class _ChatScreenState extends State<ChatScreen> {
       itemBuilder: (context, index) {
         final msg = _messages[index];
         final role = (msg['role'] as String?) ?? 'assistant';
+
+        // Tool calls / results stay collapsed as a compact chip so a finished
+        // response doesn't explode into the full tool output. Tapping a chip
+        // expands its details on demand.
+        if (_isToolMessage(msg)) {
+          return _ToolMessageBubble(
+            key: ValueKey(_toolMessageKey(msg, index)),
+            message: msg,
+            verbose: _verboseMode,
+          );
+        }
+
         final content = (msg['content'] as String?) ?? '';
         final isUser = role == 'user';
 
@@ -577,6 +614,104 @@ class _ChatScreenState extends State<ChatScreen> {
       },
     );
   }
+}
+
+/// Roles that represent tool activity rather than conversational text. These
+/// are rendered as collapsed chips instead of full message bubbles.
+const _toolRoles = {
+  'tool_progress',
+  'tool',
+  'tool_result',
+  'tool_use',
+  'tool_call',
+  'tool_calls',
+  'function',
+  'function_call',
+};
+
+/// Whether a message describes a tool call/result that should be collapsed.
+///
+/// The streaming view already shows tool activity as compact chips, but the
+/// canonical transcript returned by `GET /api/sessions/{id}/messages` stores
+/// each tool call/result as its own full message. Without this, finishing a
+/// response (or re-entering the chat) would expand every tool into its full
+/// input/output and flood the screen.
+bool _isToolMessage(Map<String, dynamic> m) {
+  final role = (m['role'] as String?)?.toLowerCase() ?? '';
+  if (_toolRoles.contains(role)) return true;
+
+  final toolCalls = m['tool_calls'];
+  if (toolCalls is List && toolCalls.isNotEmpty) return true;
+
+  final toolCallId = m['tool_call_id'] ?? m['toolCallId'];
+  if (toolCallId != null && toolCallId.toString().isNotEmpty) return true;
+
+  return false;
+}
+
+/// A stable-ish key so a collapsed chip keeps its expand/collapse state across
+/// rebuilds where possible. Falls back to the list index.
+String _toolMessageKey(Map<String, dynamic> m, int index) {
+  final id = m['tool_call_id'] ?? m['toolCallId'] ?? m['id'];
+  if (id != null && id.toString().isNotEmpty) return 'tool-$id';
+  return 'tool-$index-${_toolLabel(m)}';
+}
+
+/// Human-friendly tool name for the chip label.
+String _toolLabel(Map<String, dynamic> m) {
+  for (final key in ['label', 'tool', 'tool_name', 'name']) {
+    final v = m[key];
+    if (v is String && v.trim().isNotEmpty) return v.trim();
+  }
+
+  final toolCalls = m['tool_calls'];
+  if (toolCalls is List && toolCalls.isNotEmpty && toolCalls.first is Map) {
+    final first = toolCalls.first as Map;
+    final fn = first['function'];
+    if (fn is Map && fn['name'] is String) return fn['name'] as String;
+    final name = first['name'];
+    if (name is String && name.isNotEmpty) return name;
+  }
+
+  return 'tool';
+}
+
+/// Whether the tool has finished running (controls the chip's "— done" suffix).
+bool _toolDone(Map<String, dynamic> m) {
+  final status = (m['status'] as String?)?.toLowerCase();
+  if (status == null) return true; // persisted transcript entries are complete
+  return status == 'completed' || status == 'finished' || status == 'done';
+}
+
+/// The full, expandable detail text for a tool message (inputs + output).
+String _toolDetail(Map<String, dynamic> m) {
+  final parts = <String>[];
+
+  String stringify(Object? value) {
+    if (value == null) return '';
+    if (value is String) return value;
+    try {
+      return const JsonEncoder.withIndent('  ').convert(value);
+    } catch (_) {
+      return value.toString();
+    }
+  }
+
+  final input = m['input'] ?? m['arguments'] ?? m['args'] ?? m['parameters'];
+  final inputText = stringify(input).trim();
+  if (inputText.isNotEmpty) parts.add('Input:\n$inputText');
+
+  final content = m['content'];
+  final contentText = stringify(content).trim();
+  if (contentText.isNotEmpty) parts.add(contentText);
+
+  final output = m['output'] ?? m['result'];
+  final outputText = stringify(output).trim();
+  if (outputText.isNotEmpty && outputText != contentText) {
+    parts.add('Output:\n$outputText');
+  }
+
+  return parts.join('\n\n');
 }
 
 class _MessageBubble extends StatelessWidget {
@@ -733,6 +868,121 @@ class _MessageBubble extends StatelessWidget {
           : MainAxisAlignment.start,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [bubble],
+    );
+  }
+}
+
+/// Compact, collapsed representation of a tool call/result.
+///
+/// Renders as a small chip (emoji + tool name + status), matching the inline
+/// progress chips shown while the agent is responding. The full tool detail is
+/// hidden by default and revealed on tap, so a finished response keeps its
+/// clean, collapsed look instead of flooding the chat with raw tool output.
+class _ToolMessageBubble extends StatefulWidget {
+  final Map<String, dynamic> message;
+  final bool verbose;
+
+  const _ToolMessageBubble({
+    required this.message,
+    this.verbose = false,
+    super.key,
+  });
+
+  @override
+  State<_ToolMessageBubble> createState() => _ToolMessageBubbleState();
+}
+
+class _ToolMessageBubbleState extends State<_ToolMessageBubble> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final chipColor = isDark
+        ? const Color(0xFF2A2A2A)
+        : const Color(0xFFEAEAEA);
+    final textColor = isDark ? Colors.grey[300] : Colors.grey[800];
+
+    final label = _toolLabel(widget.message);
+    final done = _toolDone(widget.message);
+    final status = (widget.message['status'] as String?) ?? 'done';
+    final emoji = (widget.message['emoji'] as String?) ?? '🔧';
+    final headline = done ? '$label — done' : '$label — $status';
+
+    final detail = _toolDetail(widget.message);
+    final hasDetail = detail.isNotEmpty || widget.verbose;
+
+    final chip = Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: chipColor,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: hasDetail
+                ? () => setState(() => _expanded = !_expanded)
+                : null,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(emoji, style: const TextStyle(fontSize: 13)),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    headline,
+                    style: TextStyle(fontSize: 13, color: textColor),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (hasDetail) ...[
+                  const SizedBox(width: 4),
+                  Icon(
+                    _expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: textColor,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          if (_expanded && hasDetail) ...[
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              constraints: const BoxConstraints(maxHeight: 280),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: (isDark ? Colors.black : Colors.white).withValues(
+                  alpha: 0.3,
+                ),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: SingleChildScrollView(
+                child: SelectableText(
+                  detail.isEmpty ? '(no details)' : detail,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontFamily: 'monospace',
+                    color: textColor,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [Flexible(child: chip)],
     );
   }
 }
