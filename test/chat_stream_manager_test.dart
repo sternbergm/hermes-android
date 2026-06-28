@@ -12,7 +12,7 @@ typedef StreamRunner =
     Future<void> Function(
       void Function(String token) onToken,
       ToolProgressCallback onToolProgress,
-      void Function() onDone,
+      Future<void> Function() onDone,
       void Function(String error) onError,
     );
 
@@ -33,7 +33,7 @@ class FakeChatBackend implements ChatBackend {
     required List<Map<String, dynamic>> history,
     required void Function(String token) onToken,
     required ToolProgressCallback onToolProgress,
-    required void Function() onDone,
+    required Future<void> Function() onDone,
     required void Function(String error) onError,
   }) {
     return runner(onToken, onToolProgress, onDone, onError);
@@ -73,7 +73,7 @@ void main() {
       runner: (onToken, onToolProgress, onDone, onError) async {
         onToken('Hel');
         onToken('lo');
-        onDone();
+        await onDone();
       },
     );
     final manager = ChatStreamManager(backendFactory: (_) => backend);
@@ -115,7 +115,7 @@ void main() {
           'status': 'running',
         });
         await gate.future;
-        onDone();
+        await onDone();
       },
     );
     final manager = ChatStreamManager(backendFactory: (_) => backend);
@@ -170,7 +170,7 @@ void main() {
           'status': 'completed',
         });
         await gate.future;
-        onDone();
+        await onDone();
       },
     );
     final manager = ChatStreamManager(backendFactory: (_) => backend);
@@ -226,7 +226,7 @@ void main() {
       runner: (onToken, onToolProgress, onDone, onError) async {
         onToken('partial');
         await gate.future;
-        onDone();
+        await onDone();
       },
     );
     final manager = ChatStreamManager(backendFactory: (_) => backend);
@@ -260,7 +260,7 @@ void main() {
     final backend = FakeChatBackend(
       runner: (onToken, onToolProgress, onDone, onError) async {
         await gate.future;
-        onDone();
+        await onDone();
       },
     );
     final manager = ChatStreamManager(backendFactory: (_) => backend);

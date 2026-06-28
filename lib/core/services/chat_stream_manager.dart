@@ -31,7 +31,9 @@ abstract class ChatBackend {
     required List<Map<String, dynamic>> history,
     required void Function(String token) onToken,
     required ToolProgressCallback onToolProgress,
-    required void Function() onDone,
+    // Future-returning so the reconciliation in [onDone] is awaitable (the live
+    // gateway client calls it fire-and-forget, which is fine; tests await it).
+    required Future<void> Function() onDone,
     required void Function(String error) onError,
   });
 
@@ -63,7 +65,7 @@ class RealChatBackend implements ChatBackend {
     required List<Map<String, dynamic>> history,
     required void Function(String token) onToken,
     required ToolProgressCallback onToolProgress,
-    required void Function() onDone,
+    required Future<void> Function() onDone,
     required void Function(String error) onError,
   }) {
     return _gateway.sendMessageStreaming(
