@@ -4,6 +4,19 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Release notes for
 versions prior to 1.0.7 are in the **What's new** sections of the [README](README.md).
 
+## [Unreleased]
+
+### Changed
+- **Tool output stays collapsed.** Tool calls/results in the chat now render as
+  compact, tappable chips (matching the inline progress chips shown while the
+  agent responds) instead of expanding into their full input/output when a
+  response finishes or a chat is re-opened. Tap a chip to reveal its details.
+
+### Fixed
+- **Chat opens at the bottom.** Entering a conversation (and finishing a
+  response) now pins the view to the latest message like a normal chat app,
+  rather than leaving it scrolled to the top.
+
 ## [1.0.7]
 
 ### Added

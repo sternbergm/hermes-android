@@ -11,6 +11,8 @@ import 'package:speech_to_text/speech_to_text.dart';
 
 import '../services/connection_manager.dart';
 import '../utils/responsive.dart';
+import '../utils/tool_message.dart';
+import '../widgets/tool_message_chip.dart';
 
 class ChatScreen extends StatefulWidget {
   final SavedConnection connection;
@@ -199,14 +201,36 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _scrollToBottom() {
-    if (_scrollController.hasClients) {
+  void _scrollToBottom({bool animate = true}) {
+    if (!_scrollController.hasClients) return;
+    final target = _scrollController.position.maxScrollExtent;
+    if (animate) {
       _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
+        target,
         duration: const Duration(milliseconds: 300),
         curve: Curves.easeOut,
       );
+    } else {
+      _scrollController.jumpTo(target);
     }
+  }
+
+  /// Jump to the bottom after the list has had a chance to lay out.
+  ///
+  /// A single post-frame jump can undershoot because list items (and their
+  /// final heights) are built lazily, so `maxScrollExtent` may still be growing
+  /// on the first frame. Jumping again on the following frame settles us at the
+  /// true bottom — this is what keeps the chat pinned to the latest message when
+  /// entering a conversation or finishing a response.
+  void _scrollToBottomDeferred({bool animate = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _scrollToBottom(animate: animate);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _scrollToBottom(animate: false);
+      });
+    });
   }
 
   Future<void> _fetchMessages() async {
@@ -222,7 +246,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _messages = messages;
         _loading = false;
       });
-      _scrollToBottom();
+      // Start pinned to the bottom (newest message), like a regular chat app.
+      _scrollToBottomDeferred();
     } catch (e) {
       if (!mounted) return;
       final errStr = e.toString();
@@ -308,7 +333,7 @@ class _ChatScreenState extends State<ChatScreen> {
               await _speakAssistantText(assistantText);
             }
           }
-          _scrollToBottom();
+          _scrollToBottomDeferred();
         } catch (e) {
           setState(() {
             _streaming = false;
@@ -565,6 +590,18 @@ class _ChatScreenState extends State<ChatScreen> {
       itemBuilder: (context, index) {
         final msg = _messages[index];
         final role = (msg['role'] as String?) ?? 'assistant';
+
+        // Tool calls / results stay collapsed as a compact chip so a finished
+        // response doesn't explode into the full tool output. Tapping a chip
+        // expands its details on demand.
+        if (ToolMessage.isToolMessage(msg)) {
+          return ToolMessageChip(
+            key: ValueKey(_toolMessageKey(msg, index)),
+            message: msg,
+            verbose: _verboseMode,
+          );
+        }
+
         final content = (msg['content'] as String?) ?? '';
         final isUser = role == 'user';
 
@@ -577,6 +614,14 @@ class _ChatScreenState extends State<ChatScreen> {
       },
     );
   }
+}
+
+/// A stable-ish key so a collapsed tool chip keeps its expand/collapse state
+/// across rebuilds where possible. Falls back to the list index.
+String _toolMessageKey(Map<String, dynamic> m, int index) {
+  final id = m['tool_call_id'] ?? m['toolCallId'] ?? m['id'];
+  if (id != null && id.toString().isNotEmpty) return 'tool-$id';
+  return 'tool-$index-${ToolMessage.label(m)}';
 }
 
 class _MessageBubble extends StatelessWidget {

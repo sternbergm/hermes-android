@@ -26,6 +26,7 @@ Android client for [Hermes Agent](https://hermes-agent.nousresearch.com/) — ch
 
 - **Hermes chat on Android** — browse sessions, create new chats, and send prompts to your Hermes Agent.
 - **Streaming responses** — chat uses the Hermes Gateway OpenAI-compatible streaming endpoint: `POST /v1/chat/completions`. Tokens appear in real-time with smooth auto-scroll.
+- **Collapsed tool output** — tool calls/results render as compact chips instead of flooding the chat with raw input/output; tap a chip to expand its details.
 - **Messaging-style UI** — dark/light/system themes, gold Hermes accent color (`#D4AF37`), markdown rendering, relative timestamps, and responsive phone/tablet layouts.
 - **Gold/black Hermes branding** — distinctive gold accent on black background, custom app icon with mipmap densities, agent messages use grey bubbles.
 - **Gateway API integration** — sessions and chat run through the Hermes Gateway API Server, normally on port `8642`, with HTTP and HTTPS endpoints supported.
@@ -36,7 +37,7 @@ Android client for [Hermes Agent](https://hermes-agent.nousresearch.com/) — ch
 - **Memory viewer** — inspect conversation memory across sessions.
 - **Verbose mode toggle** — show raw message metadata (role, tool calls, timestamps) in chat.
 - **Three-way theme toggle** — Dark / Light / System default.
-- **Keyboard handling** — auto-scroll on keyboard open, send action on Enter, FAB to scroll to bottom.
+- **Keyboard handling** — auto-scroll on keyboard open, send action on Enter, FAB to scroll to bottom. Conversations open pinned to the latest message.
 - **Voice chat** — microphone dictation sends recognised speech to Hermes, with optional text-to-speech replies.
 
 ## Screenshots
@@ -238,8 +239,8 @@ Android app (Flutter)
 ### Chat screen
 
 - **Send messages** — Type in the input field and tap the send button or press Enter.
-- **Streaming responses** — The agent's response appears token-by-token in real-time. The chat auto-scrolls to the bottom as new tokens arrive.
-- **Tool progress** — When the agent uses tools, inline progress messages show the tool name, status, and progress.
+- **Streaming responses** — The agent's response appears token-by-token in real-time. The chat auto-scrolls to the bottom as new tokens arrive, and opens pinned to the latest message when you re-enter a conversation.
+- **Tool progress** — When the agent uses tools, each tool call/result shows as a compact, collapsed chip (tool name + status). Chips stay collapsed after the response finishes; tap one to expand its full input/output.
 - **Verbose mode** — Toggle in the app settings to show raw message metadata (role, tool call IDs, timestamps).
 - **Markdown rendering** — Assistant messages render markdown (code blocks, tables, lists, links).
 - **Relative timestamps** — Messages show "2m ago", "3h ago", etc.
