@@ -5,14 +5,16 @@ import 'package:hermes_android/core/services/chat_stream_manager.dart';
 import 'package:hermes_android/core/services/connection_manager.dart';
 
 /// The shape of [ChatBackend.stream]'s callback driving, so a test can script a
-/// stream by invoking the callbacks directly.
+/// stream by invoking the callbacks directly. Positional params keep the test
+/// closures terse (named params would be optional-with-null-default, which is
+/// illegal for these non-nullable function types).
 typedef StreamRunner =
-    Future<void> Function({
-      required void Function(String token) onToken,
-      required ToolProgressCallback onToolProgress,
-      required void Function() onDone,
-      required void Function(String error) onError,
-    });
+    Future<void> Function(
+      void Function(String token) onToken,
+      ToolProgressCallback onToolProgress,
+      void Function() onDone,
+      void Function(String error) onError,
+    );
 
 /// A [ChatBackend] with no network: the test supplies the streaming script and
 /// the canonical transcript returned by [getMessages].
@@ -34,12 +36,7 @@ class FakeChatBackend implements ChatBackend {
     required void Function() onDone,
     required void Function(String error) onError,
   }) {
-    return runner(
-      onToken: onToken,
-      onToolProgress: onToolProgress,
-      onDone: onDone,
-      onError: onError,
-    );
+    return runner(onToken, onToolProgress, onDone, onError);
   }
 
   @override
@@ -73,7 +70,7 @@ void main() {
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'Hello world'},
       ],
-      runner: ({onToken, onToolProgress, onDone, onError}) async {
+      runner: (onToken, onToolProgress, onDone, onError) async {
         onToken('Hel');
         onToken('lo');
         onDone();
@@ -109,7 +106,7 @@ void main() {
         {'role': 'user', 'content': 'go'},
         {'role': 'assistant', 'content': 'final answer'},
       ],
-      runner: ({onToken, onToolProgress, onDone, onError}) async {
+      runner: (onToken, onToolProgress, onDone, onError) async {
         onToken('Hel');
         onToken('lo');
         onToolProgress({
@@ -161,7 +158,7 @@ void main() {
   test('a second tool-progress event updates the same chip in place', () async {
     final gate = Completer<void>();
     final backend = FakeChatBackend(
-      runner: ({onToken, onToolProgress, onDone, onError}) async {
+      runner: (onToken, onToolProgress, onDone, onError) async {
         onToolProgress({
           'toolCallId': 'call_1',
           'tool': 'execute_code',
@@ -200,7 +197,7 @@ void main() {
   test('an error rolls back the optimistic user/assistant placeholders',
       () async {
     final backend = FakeChatBackend(
-      runner: ({onToken, onToolProgress, onDone, onError}) async {
+      runner: (onToken, onToolProgress, onDone, onError) async {
         onError('network down');
       },
     );
@@ -226,7 +223,7 @@ void main() {
     final gate = Completer<void>();
     final backend = FakeChatBackend(
       transcript: const [],
-      runner: ({onToken, onToolProgress, onDone, onError}) async {
+      runner: (onToken, onToolProgress, onDone, onError) async {
         onToken('partial');
         await gate.future;
         onDone();
@@ -261,7 +258,7 @@ void main() {
   test('isStreaming reflects the session lifecycle', () async {
     final gate = Completer<void>();
     final backend = FakeChatBackend(
-      runner: ({onToken, onToolProgress, onDone, onError}) async {
+      runner: (onToken, onToolProgress, onDone, onError) async {
         await gate.future;
         onDone();
       },
@@ -289,7 +286,7 @@ void main() {
       transcript: [
         {'role': 'user', 'content': 'hi'},
       ],
-      runner: ({onToken, onToolProgress, onDone, onError}) async {},
+      runner: (onToken, onToolProgress, onDone, onError) async {},
     );
     final manager = ChatStreamManager(backendFactory: (_) => backend);
 
@@ -303,7 +300,7 @@ void main() {
 
   test('releaseIfIdle keeps a stream that a screen is still observing', () {
     final manager = ChatStreamManager(backendFactory: (_) => FakeChatBackend(
-          runner: ({onToken, onToolProgress, onDone, onError}) async {},
+          runner: (onToken, onToolProgress, onDone, onError) async {},
         ));
     final stream = manager.streamFor(sessionId);
     stream.addListener(() {});
