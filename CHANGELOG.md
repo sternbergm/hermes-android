@@ -6,6 +6,16 @@ versions prior to 1.0.7 are in the **What's new** sections of the [README](READM
 
 ## [Unreleased]
 
+### Added
+- **Background streaming.** A new app-lifetime `ChatStreamManager` owns the
+  in-flight SSE stream (and its HTTP client) per session instead of the chat
+  screen. Leaving the chat or switching apps no longer aborts the agent's
+  reply — the stream keeps running and re-attaches when you return. If the OS
+  kills the app mid-reply, the turn finishes server-side and the screen
+  reconciles by refetching the transcript (and briefly polling for the pending
+  reply) on return. The app bar shows **Responding…** while streaming and
+  **Catching up…** while waiting for a server-side reply after a restart.
+
 ### Changed
 - **Tool output stays collapsed.** Tool calls/results in the chat now render as
   compact, tappable chips (matching the inline progress chips shown while the
@@ -16,6 +26,9 @@ versions prior to 1.0.7 are in the **What's new** sections of the [README](READM
 - **Chat opens at the bottom.** Entering a conversation (and finishing a
   response) now pins the view to the latest message like a normal chat app,
   rather than leaving it scrolled to the top.
+- **Leaving a chat no longer cancels the agent.** Previously, navigating away
+  from a streaming conversation disposed the screen and closed the HTTP client,
+  cutting the agent off before it could answer.
 
 ## [1.0.7]
 

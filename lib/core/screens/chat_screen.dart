@@ -1,6 +1,11 @@
 // Chat screen with real-time streaming via REST API.
 // Uses REST endpoints: POST /api/sessions/{id}/chat and
 // GET /api/sessions/{id}/messages.
+//
+// The streaming itself lives in [ChatStreamManager], not in this widget, so the
+// agent's reply keeps flowing when you leave the chat or background the app.
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -9,6 +14,7 @@ import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
+import '../services/chat_stream_manager.dart';
 import '../services/connection_manager.dart';
 import '../utils/responsive.dart';
 import '../utils/tool_message.dart';
@@ -28,17 +34,27 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
-  List<Map<String, dynamic>> _messages = [];
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _loading = true;
   String? _error;
-  late final ApiClient _client;
-  late final GatewayChatClient _gateway;
+
+  // The session's streaming state lives in an app-lifetime manager, not in this
+  // widget, so navigating away (or backgrounding the app) no longer cuts the
+  // agent's reply. This screen is just a view that attaches to it.
+  late final ChatStreamManager _manager;
+  late final ActiveChatStream _stream;
+  int _seenCompleted = 0;
+
+  // Reconciliation for replies that finish while we're gone — including after
+  // the OS kills the app and the turn keeps running server-side.
+  Timer? _pollTimer;
+  int _pollAttempts = 0;
+  bool _pollingForReply = false;
+
+  bool get _streaming => _stream.streaming;
 
   // Chat sending state
   final _textController = TextEditingController();
-  bool _sending = false;
-  bool _streaming = false;
 
   // Voice input / spoken replies
   final SpeechToText _speechToText = SpeechToText();
@@ -59,27 +75,100 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    _client = ApiClient(
-      baseUrl: widget.connection.baseUrl,
-      apiKey: widget.connection.apiKey,
-    );
-    _gateway = GatewayChatClient(_client);
-    _fetchMessages();
+    _manager = ChatStreamManager.instance;
+    _stream = _manager.streamFor(widget.session.id);
+    _seenCompleted = _stream.completedResponses;
+    _stream.addListener(_onStreamChanged);
+    WidgetsBinding.instance.addObserver(this);
     _loadVerboseMode();
     _initVoice();
     _scrollController.addListener(_onScroll);
+
+    if (_stream.streaming) {
+      // Re-attaching to a reply that's still streaming in the background — show
+      // the live state, don't refetch over it.
+      _loading = false;
+      _scrollToBottomDeferred();
+    } else {
+      // Show any cached transcript instantly, then reconcile with the server.
+      _fetchMessages(showSpinner: _stream.messages.isEmpty);
+    }
+  }
+
+  /// Rebuild as the manager pushes tokens, tool-progress chips, completion, and
+  /// errors for this session.
+  void _onStreamChanged() {
+    if (!mounted) return;
+    setState(() {});
+
+    // Follow the tail while tokens stream in, unless the user scrolled up.
+    if (_stream.streaming && !_showScrollToBottom) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _scrollToBottom();
+      });
+    }
+
+    // A reply just finished (in the foreground, or while we were away).
+    if (_stream.completedResponses != _seenCompleted) {
+      _seenCompleted = _stream.completedResponses;
+      _onResponseCompleted();
+    }
+
+    // Surface a streaming failure once, then consume it.
+    final err = _stream.error;
+    if (err != null) {
+      _stream.error = null;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Send failed: $err'),
+          backgroundColor: Colors.orange,
+          duration: const Duration(seconds: 6),
+        ),
+      );
+    }
+  }
+
+  void _onResponseCompleted() {
+    _scrollToBottomDeferred();
+    if (_awaitingVoiceReply) {
+      _awaitingVoiceReply = false;
+      final assistant = _stream.messages.reversed.firstWhere(
+        (m) => m['role'] == 'assistant',
+        orElse: () => const <String, dynamic>{},
+      );
+      final assistantText = assistant['content']?.toString();
+      if (assistantText != null) {
+        _speakAssistantText(assistantText);
+      }
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && !_stream.streaming) {
+      // Back in the foreground: pick up a reply that may have completed (or is
+      // still finishing server-side) while we were backgrounded or killed.
+      _fetchMessages(showSpinner: false);
+    }
   }
 
   Future<void> _loadVerboseMode() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() => _verboseMode = prefs.getBool('verbose_mode') ?? false);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _pollTimer?.cancel();
     _speechToText.cancel();
     _flutterTts.stop();
-    _client.close();
+    // Deliberately do NOT abort the stream — it keeps running in the manager so
+    // the agent's reply survives leaving the chat. Just stop observing it and
+    // let the manager reclaim it if it's finished and unobserved.
+    _stream.removeListener(_onStreamChanged);
+    _manager.releaseIfIdle(widget.session.id);
     _textController.dispose();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
@@ -131,7 +220,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _toggleVoiceInput() async {
-    if (_streaming || _sending || _loading) return;
+    if (_streaming || _loading) return;
     if (_listening) {
       await _speechToText.stop();
       if (!mounted) return;
@@ -233,29 +322,37 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Future<void> _fetchMessages() async {
+  Future<void> _fetchMessages({bool showSpinner = true}) async {
+    // Never clobber a live stream with a slower REST refresh.
+    if (_stream.streaming) {
+      if (_loading) setState(() => _loading = false);
+      return;
+    }
     setState(() {
-      _loading = true;
+      if (showSpinner) _loading = true;
       _error = null;
     });
 
     try {
-      final messages = await _client.getMessages(widget.session.id);
-      if (!mounted) return;
-      setState(() {
-        _messages = messages;
-        _loading = false;
-      });
+      final messages = await _manager.fetchMessages(
+        widget.connection,
+        widget.session.id,
+      );
+      if (!mounted || _stream.streaming) return;
+      _manager.setMessages(widget.session.id, messages);
+      setState(() => _loading = false);
       // Start pinned to the bottom (newest message), like a regular chat app.
       _scrollToBottomDeferred();
+      // If the last turn is still awaiting the agent's reply (e.g. the app was
+      // killed mid-stream and the turn is finishing server-side), keep polling
+      // until it lands.
+      _maybePollForPendingReply();
     } catch (e) {
       if (!mounted) return;
       final errStr = e.toString();
       if (errStr.contains('404') || errStr.contains('not found')) {
-        setState(() {
-          _messages = [];
-          _loading = false;
-        });
+        _manager.setMessages(widget.session.id, []);
+        setState(() => _loading = false);
         return;
       }
       setState(() {
@@ -265,160 +362,96 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// Send message via SSE streaming (Gateway API Server).
+  /// Whether the transcript ends on a user turn with no assistant reply yet —
+  /// the signal that the agent is (or was) still composing a response.
+  bool _awaitingAgentReply(List<Map<String, dynamic>> messages) {
+    if (messages.isEmpty) return false;
+    final role = (messages.last['role'] as String?) ?? '';
+    return role == 'user';
+  }
+
+  /// Poll the transcript for a reply that's completing server-side (the
+  /// app-was-killed case). Bounded so it can't run forever if no reply comes.
+  void _maybePollForPendingReply() {
+    _pollTimer?.cancel();
+    _pollAttempts = 0;
+    if (_stream.streaming || !_awaitingAgentReply(_stream.messages)) {
+      if (_pollingForReply) setState(() => _pollingForReply = false);
+      return;
+    }
+    setState(() => _pollingForReply = true);
+    _pollTimer = Timer.periodic(const Duration(seconds: 3), (timer) async {
+      if (!mounted || _stream.streaming) {
+        timer.cancel();
+        if (mounted && _pollingForReply) {
+          setState(() => _pollingForReply = false);
+        }
+        return;
+      }
+      if (++_pollAttempts > 20) {
+        timer.cancel();
+        setState(() => _pollingForReply = false);
+        return;
+      }
+      try {
+        final messages = await _manager.fetchMessages(
+          widget.connection,
+          widget.session.id,
+        );
+        if (!mounted || _stream.streaming) {
+          timer.cancel();
+          return;
+        }
+        _manager.setMessages(widget.session.id, messages);
+        if (!_awaitingAgentReply(messages)) {
+          timer.cancel();
+          setState(() => _pollingForReply = false);
+          _scrollToBottomDeferred();
+        }
+      } catch (_) {
+        // Transient failure — keep polling until the attempt cap.
+      }
+    });
+  }
+
+  /// Send a message. The streaming itself runs in [ChatStreamManager] so it
+  /// keeps going even if this screen is disposed; [_onStreamChanged] drives the
+  /// UI from there.
   Future<void> _sendMessage({bool speakResponse = false}) async {
     final text = _textController.text.trim();
     if (text.isEmpty) return;
-    if (_sending || _streaming) return;
+    if (_streaming) return;
 
     _textController.text = '';
     _awaitingVoiceReply = speakResponse && _voiceReplyEnabled;
+    _pollTimer?.cancel();
 
-    // Build conversation history for SSE request
+    // Build conversation history from the current transcript, before the
+    // manager appends the optimistic user/assistant placeholders.
     final history = <Map<String, dynamic>>[];
-    for (var i = _messages.length - 1; i >= 0; i--) {
-      final m = _messages[i];
+    for (var i = _stream.messages.length - 1; i >= 0; i--) {
+      final m = _stream.messages[i];
       history.add({'role': m['role'] ?? 'user', 'content': m['content'] ?? ''});
     }
 
     setState(() {
-      _sending = true;
-      _streaming = true;
       _showScrollToBottom = false;
-      _messages.add({'role': 'user', 'content': text});
-      // Insert a placeholder streaming message
-      _messages.add({'role': 'assistant', 'content': ''});
+      _pollingForReply = false;
     });
 
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
-
-    // Accumulate tokens into the streaming placeholder
-    await _gateway.sendMessageStreaming(
-      message: text,
-      sessionId: widget.session.id,
-      history: history,
-      onToken: (token) {
-        if (!mounted) return;
-        setState(() {
-          if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
-            _messages.last['content'] =
-                (_messages.last['content'] as String) + token;
-          }
-        });
-      },
-      onToolProgress: (progress) {
-        if (!mounted) return;
-        _upsertToolProgress(progress);
-      },
-      onDone: () async {
-        if (!mounted) return;
-        // Refresh messages to get the final server-side state
-        try {
-          final messages = await _client.getMessages(widget.session.id);
-          if (!mounted) return;
-          setState(() {
-            _messages = messages;
-            _streaming = false;
-            _sending = false;
-            _showScrollToBottom = false;
-          });
-          if (_awaitingVoiceReply) {
-            _awaitingVoiceReply = false;
-            final assistant = messages.reversed.firstWhere(
-              (message) => message['role'] == 'assistant',
-              orElse: () => const <String, dynamic>{},
-            );
-            final assistantText = assistant['content']?.toString();
-            if (assistantText != null) {
-              await _speakAssistantText(assistantText);
-            }
-          }
-          _scrollToBottomDeferred();
-        } catch (e) {
-          setState(() {
-            _streaming = false;
-            _sending = false;
-          });
-        }
-      },
-      onError: (error) {
-        if (!mounted) return;
-        // Remove the placeholder assistant message
-        setState(() {
-          if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
-            _messages.removeLast();
-          }
-        });
-        _handleSendError(text, error);
-      },
+    // Fire-and-forget: the manager owns the stream's lifetime.
+    unawaited(
+      _manager.send(
+        connection: widget.connection,
+        sessionId: widget.session.id,
+        text: text,
+        history: history,
+      ),
     );
-  }
 
-  void _handleSendError(String text, Object e) {
-    setState(() {
-      _sending = false;
-      _streaming = false;
-      _awaitingVoiceReply = false;
-      if (_messages.isNotEmpty &&
-          _messages.last['role'] == 'user' &&
-          _messages.last['content'] == text) {
-        _messages.removeLast();
-      }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _scrollToBottom();
     });
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Send failed: $e'),
-          backgroundColor: Colors.orange,
-          duration: const Duration(seconds: 6),
-        ),
-      );
-    }
-  }
-
-  void _upsertToolProgress(Map<String, dynamic> progress) {
-    final toolCallId =
-        progress['toolCallId']?.toString() ??
-        progress['tool_call_id']?.toString() ??
-        progress['id']?.toString() ??
-        '';
-    final tool = progress['tool']?.toString() ?? 'tool';
-    final status = progress['status']?.toString() ?? 'running';
-    final emoji = progress['emoji']?.toString() ?? '🔧';
-    final label = progress['label']?.toString();
-    final display = label == null || label.isEmpty ? tool : label;
-    final done = status == 'completed' || status == 'finished';
-    final content = done
-        ? '$emoji $display — done'
-        : '$emoji $display — $status';
-
-    setState(() {
-      final idx = toolCallId.isEmpty
-          ? -1
-          : _messages.indexWhere(
-              (m) =>
-                  m['role'] == 'tool_progress' && m['toolCallId'] == toolCallId,
-            );
-      final payload = {
-        'role': 'tool_progress',
-        'content': content,
-        'toolCallId': toolCallId,
-        'status': status,
-        'tool': tool,
-      };
-      if (idx >= 0) {
-        _messages[idx] = payload;
-      } else {
-        final insertAt =
-            _messages.isNotEmpty && _messages.last['role'] == 'assistant'
-            ? _messages.length - 1
-            : _messages.length;
-        _messages.insert(insertAt, payload);
-      }
-    });
-
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
   }
 
   @override
@@ -431,18 +464,23 @@ class _ChatScreenState extends State<ChatScreen> {
           overflow: TextOverflow.ellipsis,
         ),
         actions: [
-          if (_streaming)
-            const Padding(
-              padding: EdgeInsets.only(right: 8),
+          if (_streaming || _pollingForReply)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
               child: Row(
                 children: [
-                  SizedBox(
+                  const SizedBox(
                     width: 20,
                     height: 20,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
-                  SizedBox(width: 8),
-                  Text('Responding…', style: TextStyle(fontSize: 13)),
+                  const SizedBox(width: 8),
+                  // While streaming we're live; while polling the reply is
+                  // still finishing server-side (e.g. after an app restart).
+                  Text(
+                    _streaming ? 'Responding…' : 'Catching up…',
+                    style: const TextStyle(fontSize: 13),
+                  ),
                 ],
               ),
             )
@@ -509,7 +547,7 @@ class _ChatScreenState extends State<ChatScreen> {
             IconButton.filledTonal(
               icon: Icon(_listening ? Icons.mic_off : Icons.mic),
               color: _listening ? Theme.of(context).colorScheme.error : null,
-              onPressed: (!_loading && !_streaming && !_sending)
+              onPressed: (!_loading && !_streaming)
                   ? _toggleVoiceInput
                   : null,
               tooltip: _listening ? 'Stop listening' : 'Speak to Hermes',
@@ -583,12 +621,13 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
+    final messages = _stream.messages;
     return ListView.builder(
       controller: _scrollController,
       padding: const EdgeInsets.only(bottom: 4),
-      itemCount: _messages.length,
+      itemCount: messages.length,
       itemBuilder: (context, index) {
-        final msg = _messages[index];
+        final msg = messages[index];
         final role = (msg['role'] as String?) ?? 'assistant';
 
         // Tool calls / results stay collapsed as a compact chip so a finished

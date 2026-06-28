@@ -26,6 +26,7 @@ Android client for [Hermes Agent](https://hermes-agent.nousresearch.com/) — ch
 
 - **Hermes chat on Android** — browse sessions, create new chats, and send prompts to your Hermes Agent.
 - **Streaming responses** — chat uses the Hermes Gateway OpenAI-compatible streaming endpoint: `POST /v1/chat/completions`. Tokens appear in real-time with smooth auto-scroll.
+- **Background streaming** — replies keep streaming even if you leave the chat or switch apps; the stream is owned by an app-lifetime manager, not the screen. Re-open the conversation to find the answer waiting (or still streaming). If the app is killed mid-reply, the turn finishes server-side and is reconciled on return.
 - **Collapsed tool output** — tool calls/results render as compact chips instead of flooding the chat with raw input/output; tap a chip to expand its details.
 - **Messaging-style UI** — dark/light/system themes, gold Hermes accent color (`#D4AF37`), markdown rendering, relative timestamps, and responsive phone/tablet layouts.
 - **Gold/black Hermes branding** — distinctive gold accent on black background, custom app icon with mipmap densities, agent messages use grey bubbles.
@@ -240,6 +241,8 @@ Android app (Flutter)
 
 - **Send messages** — Type in the input field and tap the send button or press Enter.
 - **Streaming responses** — The agent's response appears token-by-token in real-time. The chat auto-scrolls to the bottom as new tokens arrive, and opens pinned to the latest message when you re-enter a conversation.
+- **Background streaming** — Leaving the chat (or switching to another app) no longer cuts the agent off mid-reply. The stream is owned by a singleton `ChatStreamManager`, so it keeps running while you're away; re-opening the conversation re-attaches to the live stream or shows the finished answer. The app bar shows **Responding…** while streaming and **Catching up…** while it waits for a reply that's still finishing server-side after a restart.
+- **Surviving an app restart** — The agent runs server-side, so even if Android kills the app while a reply is in flight, the turn keeps going on the server. When you re-open the conversation, the app refetches the canonical transcript and briefly polls for the pending reply until it lands.
 - **Tool progress** — When the agent uses tools, each tool call/result shows as a compact, collapsed chip (tool name + status). Chips stay collapsed after the response finishes; tap one to expand its full input/output.
 - **Verbose mode** — Toggle in the app settings to show raw message metadata (role, tool call IDs, timestamps).
 - **Markdown rendering** — Assistant messages render markdown (code blocks, tables, lists, links).
