@@ -23,6 +23,14 @@ versions prior to 1.0.7 are in the **What's new** sections of the [README](READM
   response finishes or a chat is re-opened. Tap a chip to reveal its details.
 
 ### Fixed
+- **Conversations no longer halt while a slow model is thinking.** The chat
+  stream used a default `http.Client`, whose underlying `HttpClient.idleTimeout`
+  is 15 s. When a model took longer than that to produce its first token (common
+  with large models or heavy tool contexts), no bytes flowed on the socket, Dart
+  closed it as "idle", and the gateway aborted the turn
+  (`interrupted_during_api_call`) — leaving the chat stuck on "Catching up…".
+  The streaming client now uses a 10-minute idle timeout so quiet stretches
+  don't drop the connection.
 - **Chat opens at the bottom.** Entering a conversation (and finishing a
   response) now pins the view to the latest message like a normal chat app,
   rather than leaving it scrolled to the top.

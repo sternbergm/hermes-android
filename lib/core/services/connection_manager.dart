@@ -2,7 +2,9 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show HttpClient;
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart' show IOClient;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../models/connection.dart';
@@ -97,6 +99,22 @@ class ConnectionManager {
   }
 }
 
+/// Builds an HTTP client tuned for long-lived SSE chat streaming.
+///
+/// Dart's default `HttpClient.idleTimeout` is 15 seconds. While a slow model
+/// composes its first token, no bytes flow on the streaming socket, so the
+/// client treats the connection as idle and closes it. The gateway then sees
+/// the disconnect mid-turn and aborts the agent run
+/// (`interrupted_during_api_call`), leaving the chat stuck on "Catching up…".
+/// A long idle timeout keeps the stream open through those quiet stretches so
+/// slow-first-token / heavy tool-context turns aren't dropped.
+http.Client _buildHttpClient() {
+  final inner = HttpClient()
+    ..idleTimeout = const Duration(minutes: 10)
+    ..connectionTimeout = const Duration(seconds: 30);
+  return IOClient(inner);
+}
+
 /// HTTP client for the Hermes Gateway API Server (port 8642).
 ///
 /// Uses Bearer token auth. Same pattern as hermes-desktop.
@@ -114,7 +132,7 @@ class ApiClient {
        baseUrl = baseUrl.endsWith('/')
            ? baseUrl.substring(0, baseUrl.length - 1)
            : baseUrl,
-       _http = httpClient ?? http.Client();
+       _http = httpClient ?? _buildHttpClient();
 
   Map<String, String> get _headers => {
     'Authorization': 'Bearer $_apiKey',
