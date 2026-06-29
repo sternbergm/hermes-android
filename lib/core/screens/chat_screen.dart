@@ -500,10 +500,100 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           child: Column(
             children: [
               Expanded(child: _buildBody()),
+              if (_stream.pendingApproval != null)
+                _buildApprovalCard(_stream.pendingApproval!),
               _buildInputBar(),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// Banner shown above the input bar when the agent pauses for a tool
+  /// approval (the gateway's `approval.request`). Mirrors the desktop/Telegram
+  /// flow: Allow once / this session / always / Deny.
+  Widget _buildApprovalCard(Map<String, dynamic> approval) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final description =
+        approval['description']?.toString() ??
+        'The agent wants to run a tool that needs your approval.';
+    final command = approval['command']?.toString() ?? '';
+
+    void choose(String choice) => _manager.approve(widget.session.id, choice);
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(8, 4, 8, 4),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: (isDark ? const Color(0xFF3A2E12) : const Color(0xFFFFF6E0)),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFD4AF37)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.verified_user_outlined,
+                  size: 18, color: Color(0xFFD4AF37)),
+              const SizedBox(width: 8),
+              Text(
+                'Approval needed',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(description, style: theme.textTheme.bodyMedium),
+          if (command.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: (isDark ? Colors.white : Colors.black).withValues(
+                  alpha: 0.06,
+                ),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: SelectableText(
+                command,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+              ),
+            ),
+          ],
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              FilledButton(
+                onPressed: () => choose('once'),
+                child: const Text('Allow once'),
+              ),
+              OutlinedButton(
+                onPressed: () => choose('session'),
+                child: const Text('This session'),
+              ),
+              OutlinedButton(
+                onPressed: () => choose('always'),
+                child: const Text('Always'),
+              ),
+              TextButton(
+                onPressed: () => choose('deny'),
+                style: TextButton.styleFrom(
+                  foregroundColor: theme.colorScheme.error,
+                ),
+                child: const Text('Deny'),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }

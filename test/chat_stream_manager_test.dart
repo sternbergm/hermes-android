@@ -14,6 +14,7 @@ typedef StreamRunner =
       ToolProgressCallback onToolProgress,
       Future<void> Function() onDone,
       void Function(String error) onError,
+      void Function(Map<String, dynamic> approval) onApproval,
     );
 
 /// A [ChatBackend] with no network: the test supplies the streaming script and
@@ -25,24 +26,33 @@ class FakeChatBackend implements ChatBackend {
   List<Map<String, dynamic>> transcript;
   bool closed = false;
   int getMessagesCalls = 0;
+  final List<List<String>> approvals = []; // [runId, choice] pairs
 
   @override
   Future<void> stream({
     required String message,
     required String sessionId,
     required List<Map<String, dynamic>> history,
+    required void Function(String runId) onRunStarted,
     required void Function(String token) onToken,
     required ToolProgressCallback onToolProgress,
+    required void Function(Map<String, dynamic> approval) onApproval,
     required Future<void> Function() onDone,
     required void Function(String error) onError,
   }) {
-    return runner(onToken, onToolProgress, onDone, onError);
+    onRunStarted('run-fake');
+    return runner(onToken, onToolProgress, onDone, onError, onApproval);
   }
 
   @override
   Future<List<Map<String, dynamic>>> getMessages(String sessionId) async {
     getMessagesCalls++;
     return transcript;
+  }
+
+  @override
+  Future<void> approve(String runId, String choice) async {
+    approvals.add([runId, choice]);
   }
 
   @override
@@ -70,7 +80,7 @@ void main() {
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'Hello world'},
       ],
-      runner: (onToken, onToolProgress, onDone, onError) async {
+      runner: (onToken, onToolProgress, onDone, onError, onApproval) async {
         onToken('Hel');
         onToken('lo');
         await onDone();
@@ -106,7 +116,7 @@ void main() {
         {'role': 'user', 'content': 'go'},
         {'role': 'assistant', 'content': 'final answer'},
       ],
-      runner: (onToken, onToolProgress, onDone, onError) async {
+      runner: (onToken, onToolProgress, onDone, onError, onApproval) async {
         onToken('Hel');
         onToken('lo');
         onToolProgress({
@@ -158,7 +168,7 @@ void main() {
   test('a second tool-progress event updates the same chip in place', () async {
     final gate = Completer<void>();
     final backend = FakeChatBackend(
-      runner: (onToken, onToolProgress, onDone, onError) async {
+      runner: (onToken, onToolProgress, onDone, onError, onApproval) async {
         onToolProgress({
           'toolCallId': 'call_1',
           'tool': 'execute_code',
@@ -197,7 +207,7 @@ void main() {
   test('an error rolls back the optimistic user/assistant placeholders',
       () async {
     final backend = FakeChatBackend(
-      runner: (onToken, onToolProgress, onDone, onError) async {
+      runner: (onToken, onToolProgress, onDone, onError, onApproval) async {
         onError('network down');
       },
     );
@@ -223,7 +233,7 @@ void main() {
     final gate = Completer<void>();
     final backend = FakeChatBackend(
       transcript: const [],
-      runner: (onToken, onToolProgress, onDone, onError) async {
+      runner: (onToken, onToolProgress, onDone, onError, onApproval) async {
         onToken('partial');
         await gate.future;
         await onDone();
@@ -258,7 +268,7 @@ void main() {
   test('isStreaming reflects the session lifecycle', () async {
     final gate = Completer<void>();
     final backend = FakeChatBackend(
-      runner: (onToken, onToolProgress, onDone, onError) async {
+      runner: (onToken, onToolProgress, onDone, onError, onApproval) async {
         await gate.future;
         await onDone();
       },
@@ -286,7 +296,7 @@ void main() {
       transcript: [
         {'role': 'user', 'content': 'hi'},
       ],
-      runner: (onToken, onToolProgress, onDone, onError) async {},
+      runner: (onToken, onToolProgress, onDone, onError, onApproval) async {},
     );
     final manager = ChatStreamManager(backendFactory: (_) => backend);
 
@@ -300,7 +310,7 @@ void main() {
 
   test('releaseIfIdle keeps a stream that a screen is still observing', () {
     final manager = ChatStreamManager(backendFactory: (_) => FakeChatBackend(
-          runner: (onToken, onToolProgress, onDone, onError) async {},
+          runner: (onToken, onToolProgress, onDone, onError, onApproval) async {},
         ));
     final stream = manager.streamFor(sessionId);
     stream.addListener(() {});
@@ -308,5 +318,49 @@ void main() {
     manager.releaseIfIdle(sessionId);
     // Same instance is returned — it was not reclaimed.
     expect(identical(manager.streamFor(sessionId), stream), isTrue);
+  });
+
+  test('an approval request pauses the run and approve() answers it', () async {
+    final gate = Completer<void>();
+    final backend = FakeChatBackend(
+      runner: (onToken, onToolProgress, onDone, onError, onApproval) async {
+        onApproval({
+          'event': 'approval.request',
+          'command': 'echo hi',
+          'description': 'Run a shell command',
+          'choices': ['once', 'session', 'always', 'deny'],
+        });
+        await gate.future;
+        await onDone();
+      },
+    );
+    final manager = ChatStreamManager(backendFactory: (_) => backend);
+    final stream = manager.streamFor(sessionId);
+    stream.addListener(() {});
+
+    final pending = manager.send(
+      connection: _conn(),
+      sessionId: sessionId,
+      text: 'go',
+      history: const [],
+    );
+    await _tick();
+
+    // The approval prompt is surfaced and the run id captured.
+    expect(stream.pendingApproval, isNotNull);
+    expect(stream.pendingApproval!['command'], 'echo hi');
+    expect(stream.runId, 'run-fake');
+
+    // Answering it forwards the choice to the backend and clears the prompt.
+    await manager.approve(sessionId, 'once');
+    expect(backend.approvals, [
+      ['run-fake', 'once'],
+    ]);
+    expect(stream.pendingApproval, isNull);
+
+    gate.complete();
+    await pending;
+    expect(stream.streaming, isFalse);
+    expect(stream.pendingApproval, isNull);
   });
 }

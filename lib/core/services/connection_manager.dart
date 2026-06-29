@@ -439,6 +439,170 @@ class GatewayChatClient {
     }
   }
 
+  /// Stream an agent run via the structured **`/v1/runs`** API.
+  ///
+  /// Unlike `/v1/chat/completions`, this surface carries **tool-approval
+  /// requests** (`approval.request`) — the same handshake the desktop/Telegram
+  /// clients use — so the UI can prompt instead of the gateway silently
+  /// denying. Text arrives via [onToken], tool lifecycle via [onToolProgress],
+  /// and an approval pause via [onApproval]; answer it with
+  /// [respondToApproval]. [onRunStarted] hands back the `run_id` needed to
+  /// approve.
+  Future<void> streamRun({
+    required String message,
+    required String sessionId,
+    List<Map<String, dynamic>>? history,
+    required void Function(String runId) onRunStarted,
+    required void Function(String token) onToken,
+    ToolProgressCallback? onToolProgress,
+    required void Function(Map<String, dynamic> approval) onApproval,
+    required void Function() onDone,
+    required void Function(String error) onError,
+  }) async {
+    final headers = {..._api._headers, 'X-Hermes-Session-Id': sessionId};
+    try {
+      // 1. Start the run (returns a run_id immediately). Binding the run to the
+      // app's [sessionId] (via the `session_id` body field) makes it persist
+      // under that id — so the session list and the post-stream
+      // `getMessages` reconciliation keep working — while the gateway
+      // auto-loads prior turns from the session, so we don't resend history.
+      final startReq = http.Request('POST', Uri.parse('$_baseUrl/v1/runs'));
+      startReq.headers.addAll(headers);
+      startReq.body = jsonEncode({
+        'input': message,
+        'session_id': sessionId,
+      });
+      final startResp = await _api._http.send(startReq);
+      final startBody = await startResp.stream.bytesToString();
+      if (startResp.statusCode != 200 && startResp.statusCode != 202) {
+        onError(_extractError(startBody, startResp.statusCode));
+        return;
+      }
+      String? runId;
+      try {
+        runId = (jsonDecode(startBody) as Map)['run_id']?.toString();
+      } catch (_) {}
+      if (runId == null || runId.isEmpty) {
+        onError('Gateway did not return a run id');
+        return;
+      }
+      onRunStarted(runId);
+
+      // 2. Stream the structured event feed for this run.
+      final evReq = http.Request(
+        'GET',
+        Uri.parse('$_baseUrl/v1/runs/$runId/events'),
+      );
+      evReq.headers.addAll(_api._headers);
+      final evResp = await _api._http.send(evReq);
+      if (evResp.statusCode != 200) {
+        onError(_extractError(
+          await evResp.stream.bytesToString(),
+          evResp.statusCode,
+        ));
+        return;
+      }
+
+      String buffer = '';
+      await evResp.stream.transform(utf8.decoder).forEach((chunk) {
+        buffer += chunk;
+        while (buffer.contains('\n\n')) {
+          final end = buffer.indexOf('\n\n');
+          final frame = buffer.substring(0, end);
+          buffer = buffer.substring(end + 2);
+          _handleRunFrame(
+            frame,
+            onToken: onToken,
+            onToolProgress: onToolProgress,
+            onApproval: onApproval,
+          );
+        }
+      });
+      onDone();
+    } catch (e) {
+      onError(e.toString());
+    }
+  }
+
+  /// Parse one `/v1/runs/{id}/events` SSE frame. Each frame is a `data:` line
+  /// whose JSON carries an `event` discriminator (there is no `event:` line).
+  static void _handleRunFrame(
+    String frame, {
+    required void Function(String token) onToken,
+    ToolProgressCallback? onToolProgress,
+    required void Function(Map<String, dynamic> approval) onApproval,
+  }) {
+    final dataLines = <String>[];
+    for (final raw in frame.split('\n')) {
+      final line = raw.trimRight();
+      if (line.startsWith('data:')) dataLines.add(line.substring(5).trimLeft());
+    }
+    if (dataLines.isEmpty) return;
+    final data = dataLines.join('\n').trim();
+    if (data.isEmpty || data == '[DONE]') return;
+    Map<String, dynamic> ev;
+    try {
+      final parsed = jsonDecode(data);
+      if (parsed is! Map<String, dynamic>) return;
+      ev = parsed;
+    } catch (_) {
+      return;
+    }
+
+    switch (ev['event']?.toString()) {
+      case 'message.delta':
+        final delta = ev['delta']?.toString() ?? '';
+        if (delta.isNotEmpty) onToken(delta);
+        break;
+      case 'tool.started':
+        onToolProgress?.call({
+          'toolCallId': ev['tool']?.toString() ?? 'tool',
+          'tool': ev['tool'],
+          'status': 'running',
+          if (ev['preview'] != null) 'label': ev['preview'],
+        });
+        break;
+      case 'tool.completed':
+      case 'tool.failed':
+        onToolProgress?.call({
+          'toolCallId': ev['tool']?.toString() ?? 'tool',
+          'tool': ev['tool'],
+          'status': ev['error'] == true ? 'failed' : 'completed',
+        });
+        break;
+      case 'approval.request':
+        onApproval(ev);
+        break;
+      // approval.responded / reasoning.available / run.completed are handled
+      // by the stream completing (onDone) and the post-run transcript refresh.
+    }
+  }
+
+  /// Answer a pending [streamRun] approval. [choice] is one of `once`,
+  /// `session`, `always`, `deny`.
+  Future<void> respondToApproval({
+    required String runId,
+    required String choice,
+  }) async {
+    final resp = await _api._http.post(
+      Uri.parse('$_baseUrl/v1/runs/$runId/approval'),
+      headers: _api._headers,
+      body: jsonEncode({'choice': choice}),
+    );
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw Exception('Approval failed: HTTP ${resp.statusCode}');
+    }
+  }
+
+  String _extractError(String body, int status) {
+    try {
+      final err = jsonDecode(body);
+      return err['error']?['message'] ?? err['message'] ?? 'HTTP $status';
+    } catch (_) {
+      return 'HTTP $status';
+    }
+  }
+
   void abort() {
     _api.close();
   }

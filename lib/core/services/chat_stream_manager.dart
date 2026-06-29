@@ -24,13 +24,16 @@ import 'connection_manager.dart';
 /// manager's logic can be exercised without a server.
 abstract class ChatBackend {
   /// Stream an assistant reply. Resolves when the stream ends (after [onDone]
-  /// or [onError] has fired).
+  /// or [onError] has fired). [onRunStarted] hands back the gateway run id, and
+  /// [onApproval] fires when the agent pauses for a tool approval.
   Future<void> stream({
     required String message,
     required String sessionId,
     required List<Map<String, dynamic>> history,
+    required void Function(String runId) onRunStarted,
     required void Function(String token) onToken,
     required ToolProgressCallback onToolProgress,
+    required void Function(Map<String, dynamic> approval) onApproval,
     // Future-returning so the reconciliation in [onDone] is awaitable (the live
     // gateway client calls it fire-and-forget, which is fine; tests await it).
     required Future<void> Function() onDone,
@@ -39,6 +42,10 @@ abstract class ChatBackend {
 
   /// Fetch the canonical, server-side transcript for [sessionId].
   Future<List<Map<String, dynamic>>> getMessages(String sessionId);
+
+  /// Answer a pending tool approval for [runId] (`once`/`session`/`always`/
+  /// `deny`); the run then resumes server-side.
+  Future<void> approve(String runId, String choice);
 
   /// Release the underlying HTTP client.
   void close();
@@ -63,17 +70,21 @@ class RealChatBackend implements ChatBackend {
     required String message,
     required String sessionId,
     required List<Map<String, dynamic>> history,
+    required void Function(String runId) onRunStarted,
     required void Function(String token) onToken,
     required ToolProgressCallback onToolProgress,
+    required void Function(Map<String, dynamic> approval) onApproval,
     required Future<void> Function() onDone,
     required void Function(String error) onError,
   }) {
-    return _gateway.sendMessageStreaming(
+    return _gateway.streamRun(
       message: message,
       sessionId: sessionId,
       history: history,
+      onRunStarted: onRunStarted,
       onToken: onToken,
       onToolProgress: onToolProgress,
+      onApproval: onApproval,
       onDone: onDone,
       onError: onError,
     );
@@ -82,6 +93,10 @@ class RealChatBackend implements ChatBackend {
   @override
   Future<List<Map<String, dynamic>>> getMessages(String sessionId) =>
       _api.getMessages(sessionId);
+
+  @override
+  Future<void> approve(String runId, String choice) =>
+      _gateway.respondToApproval(runId: runId, choice: choice);
 
   @override
   void close() => _api.close();
@@ -105,6 +120,15 @@ class ActiveChatStream extends ChangeNotifier {
 
   /// The last streaming error, surfaced to the screen as a snackbar.
   String? error;
+
+  /// The active gateway run id for this turn (needed to answer an approval).
+  String? runId;
+
+  /// A pending tool-approval request (the gateway's `approval.request` event:
+  /// `{command, description, choices, ...}`), or null. While set, the agent is
+  /// paused waiting for the user's choice. Survives leaving the chat, like the
+  /// stream itself.
+  Map<String, dynamic>? pendingApproval;
 
   /// Bumped each time a streamed reply finishes. Lets a (re-)attached screen
   /// distinguish "a response just completed" (scroll to bottom, speak it) from
@@ -142,6 +166,10 @@ class ChatStreamManager {
   final ChatBackend Function(SavedConnection) backendFactory;
 
   final Map<String, ActiveChatStream> _streams = {};
+
+  /// The in-flight backend per session, kept so [approve] can reach the same
+  /// connection that started the run.
+  final Map<String, ChatBackend> _activeBackends = {};
 
   /// The stream state for [sessionId], creating an empty one on first use.
   ActiveChatStream streamFor(String sessionId) =>
@@ -188,6 +216,8 @@ class ChatStreamManager {
 
     s.error = null;
     s.streaming = true;
+    s.runId = null;
+    s.pendingApproval = null;
     // Optimistically show the user's message and an empty assistant bubble to
     // stream into.
     s.messages = [
@@ -198,11 +228,17 @@ class ChatStreamManager {
     s._notify();
 
     final backend = backendFactory(connection);
+    _activeBackends[sessionId] = backend;
 
     await backend.stream(
       message: text,
       sessionId: sessionId,
       history: history,
+      onRunStarted: (runId) => s.runId = runId,
+      onApproval: (approval) {
+        s.pendingApproval = approval;
+        s._notify();
+      },
       onToken: (token) {
         if (s.messages.isNotEmpty && s.messages.last['role'] == 'assistant') {
           s.messages.last['content'] =
@@ -220,7 +256,10 @@ class ChatStreamManager {
         }
         s.streaming = false;
         s.completedResponses++;
+        s.runId = null;
+        s.pendingApproval = null;
         s._notify();
+        _activeBackends.remove(sessionId);
         backend.close();
         // If no screen is watching (finished in the background), reclaim it.
         releaseIfIdle(sessionId);
@@ -240,11 +279,33 @@ class ChatStreamManager {
         }
         s.streaming = false;
         s.error = err;
+        s.runId = null;
+        s.pendingApproval = null;
         s._notify();
+        _activeBackends.remove(sessionId);
         backend.close();
         releaseIfIdle(sessionId);
       },
     );
+  }
+
+  /// Answer the pending tool approval for [sessionId]. [choice] is one of
+  /// `once`, `session`, `always`, `deny`. Clears the prompt immediately; the
+  /// run resumes server-side and tokens keep streaming into the same session.
+  Future<void> approve(String sessionId, String choice) async {
+    final s = _streams[sessionId];
+    final backend = _activeBackends[sessionId];
+    final runId = s?.runId;
+    if (s == null || backend == null || runId == null) return;
+    // Optimistically clear the prompt so the UI returns to the streaming view.
+    s.pendingApproval = null;
+    s._notify();
+    try {
+      await backend.approve(runId, choice);
+    } catch (e) {
+      s.error = 'Approval failed: $e';
+      s._notify();
+    }
   }
 
   /// Drop a session's state if it is idle (not streaming) and unobserved, so
